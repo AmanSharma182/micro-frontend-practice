@@ -437,6 +437,151 @@ Reasons:
 
 ---
 
+## 1. Why we are writing this
+
+We are building a micro-frontend system with three apps:
+
+- **Shell**: the main app. It owns the layout and navigation and brings the other apps together.
+- **ABC**: a remote app. Already built, using Next.js 13 with the App Router.
+- **XYZ**: a remote app. Not built yet.
+
+Before we write code for the Shell and XYZ, we need to decide where the code lives. This choice is hard to undo later, because it affects CI/CD, how we share code, how we version things, and how teams work day to day.
+
+There are two options:
+
+- **Polyrepo**: one Git repository per app.
+- **Monorepo**: one Git repository that holds all the apps and the shared packages.
+
+This section explains both, shows how each would look for us, and lists the pros and cons. It does not depend on how the apps are integrated at runtime. That is covered separately.
+
+---
+
+## 2. Polyrepo
+
+### What it is
+
+Each app has its own repository, its own `package.json`, its own pipeline and its own release cycle.
+
+```
+repo: shell      -> Next.js app
+repo: abc        -> Next.js 13 app (exists today)
+repo: xyz        -> Next.js app
+repo: ui-shared  -> (optional) shared components, published to a private npm registry
+```
+
+### How it would work for us
+
+- ABC stays where it is. We don't touch it.
+- Shell and XYZ each get a new repo.
+- Each repo builds, tests and deploys on its own.
+- If we need shared code (design system, auth helpers, types), we publish it as a versioned package to a private registry such as GitHub Packages, npm private or Artifactory. Each app installs it like any other dependency.
+
+### Pros
+
+- **No migration for ABC.** It keeps its repo, history and pipeline. This is a real saving, since ABC is already built.
+- **True independence.** Each team owns its repo, its release schedule and its tooling. One team's broken build does not block the others.
+- **Clear ownership and access control.** Permissions, code owners and branch rules are simple because they are per repo.
+- **Small and fast per repo.** Clone, install and CI times stay low because each repo only has one app.
+- **Fits independent deployments.** The apps are deployed separately, so keeping the repos separate feels natural.
+- **Easy to hand over.** A repo can move to another team or vendor without untangling anything.
+
+### Cons
+
+- **Shared code is painful.** Every change to a shared package needs: change, publish, bump the version in each consuming app, redeploy. This is slow, and people tend to skip it.
+- **Version drift.** After a few months, each app may be on a different version of React, Next.js or the shared UI package. Nothing forces them to stay in line.
+- **Problems show up late.** If one app upgrades a shared library in a way that breaks another app, we may only find out in staging or production, not at build time.
+- **Cross-app changes are hard.** A change that touches Shell and XYZ together needs two PRs in two repos, merged and deployed in the right order.
+- **Duplicated setup.** ESLint, TypeScript, Prettier, CI templates and Docker files get copied into every repo and slowly drift apart.
+- **Harder to see the whole system.** Searching for "who uses this function" across repos is manual work.
+
+---
+
+## 3. Monorepo
+
+### What it is
+
+All apps live in one repository. Shared code lives in internal packages in the same repo. A workspace tool (pnpm workspaces, plus Turborepo or Nx) manages dependencies and builds.
+
+```
+repo: frontend-platform
+  apps/
+    shell/
+    abc/
+    xyz/
+  packages/
+    ui/              -> shared components
+    auth/            -> shared auth helpers
+    config/          -> shared eslint, tsconfig, prettier
+    types/           -> shared types
+```
+
+### How it would work for us
+
+- We move ABC into `apps/abc`. We should keep its Git history (for example with `git subtree` or `git filter-repo`) so we don't lose blame and log.
+- Shell and XYZ are created directly in `apps/`.
+- Shared code is imported from `packages/*` using workspace links. No publishing step.
+- Each app still builds into its own output and is deployed on its own. The repo is shared, but the deployment is not. A monorepo does **not** mean a monolith.
+- CI uses the build tool to detect which apps changed (`turbo run build --filter=...[origin/main]`, or `nx affected`) so we only build and test what is needed.
+
+### Pros
+
+- **Shared code is easy.** Change a shared package and every app sees it immediately, in the same PR. No publishing, no version bumps.
+- **One version of key dependencies.** We can pin `react`, `react-dom` and `next` once at the root, which removes most of the version drift.
+- **Atomic changes.** One PR can update Shell and XYZ together. Reviewers see the full impact in one place.
+- **Problems show up early.** If a change breaks another app, CI for that PR fails. We find out before merge.
+- **One setup for tooling.** One ESLint config, one TypeScript base config, one CI pipeline template.
+- **Easy to search and refactor.** Renaming a shared function across all apps is one change.
+- **Build caching.** Turborepo and Nx cache results, so unchanged apps don't rebuild.
+
+### Cons
+
+- **ABC needs to be migrated.** It means moving the code, fixing paths, and updating its pipeline and deploy setup. This is real work and has some risk, even if small.
+- **We are pushed toward alignment.** If ABC must stay on Next 13 for a long time while we want a newer version for XYZ, a single-version policy gets awkward. Workspaces can hold different versions per app, but then we lose part of the benefit.
+- **Tooling has a learning curve.** Someone has to own the workspace setup, the task graph, caching and CI filters. If it is set up badly, builds get slow.
+- **CI can get slow as the repo grows.** It needs "affected only" builds and remote caching to stay fast.
+- **Access control is coarser.** Everyone with access to the repo can see all apps. We can use `CODEOWNERS` to protect folders, but it is not the same as separate repos.
+- **Larger blast radius for mistakes.** A bad change to a shared package can break all apps at once. Good tests and review rules are needed.
+- **Teams are coupled in small ways.** Shared lockfile, shared main branch, shared CI queue.
+
+---
+
+## 4. Side by side
+
+| Topic | Polyrepo | Monorepo |
+| --- | --- | --- |
+| Setup effort for ABC | None | Medium (migration needed) |
+| Sharing code | Publish packages, bump versions | Import from workspace |
+| Dependency alignment (React, Next) | Manual, easy to drift | Enforced at the root |
+| Cross-app change | Several PRs, ordered deploys | One PR |
+| Where breakages are caught | Often late (staging or prod) | In CI, before merge |
+| Team independence | High | Medium |
+| Access control | Per repo | Per folder (CODEOWNERS) |
+| CI speed at scale | Fast per repo | Needs caching and affected builds |
+| Tooling complexity | Low per repo, duplicated | Higher, but done once |
+| Independent deploys | Yes | Yes (if pipelines are per app) |
+
+---
+
+## 5. Proposed direction
+
+This is a proposal for discussion, not a final decision.
+
+**Lean towards a monorepo** if:
+
+- The same team (or closely working teams) owns all three apps.
+- We expect a shared design system and shared auth.
+- We want strict control over React and Next.js versions.
+
+**Lean towards polyrepo** if:
+
+- Different teams or vendors own different apps and need full autonomy.
+- ABC will not be moved and must keep its own pipeline.
+- Shared code is small and rarely changes.
+
+A middle path is possible: keep ABC in its own repo for now, put Shell and XYZ together in a new monorepo, and publish the shared UI package to a private registry. We can move ABC in later once we are comfortable.
+
+---
+
 ## Risks and open questions
 
 | Item | Owner | Status |
